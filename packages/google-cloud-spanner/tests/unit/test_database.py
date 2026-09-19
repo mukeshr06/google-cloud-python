@@ -1785,6 +1785,65 @@ class TestDatabase(_BaseTest):
             database.run_in_transaction(nested_unit_of_work)
         self.assertEqual(inner.call_count, 0)
 
+    def test_run_in_transaction_recovers_after_session_acquisition_failure(self):
+        from google.api_core.exceptions import ServiceUnavailable
+
+        instance = _Instance(self.INSTANCE_NAME, client=_Client())
+        database = self._make_one(self.DATABASE_ID, instance, pool=_Pool())
+        session = mock.create_autospec(Session, instance=True)
+        session.run_in_transaction.return_value = "committed"
+        unit_of_work = mock.Mock()
+        error = ServiceUnavailable("Spanner is temporarily unavailable")
+
+        with (
+            mock.patch.object(
+                database._sessions_manager,
+                "get_session",
+                side_effect=[error, session],
+            ) as get_session,
+            mock.patch.object(database._sessions_manager, "put_session") as put_session,
+        ):
+            with self.assertRaises(ServiceUnavailable) as raised:
+                database.run_in_transaction(unit_of_work)
+
+            self.assertIs(raised.exception, error)
+            unit_of_work.assert_not_called()
+            put_session.assert_not_called()
+
+            # A later call on the same thread must not look like a nested transaction.
+            result = database.run_in_transaction(unit_of_work)
+
+            self.assertEqual(result, "committed")
+            self.assertEqual(
+                get_session.call_args_list,
+                [mock.call(TransactionType.READ_WRITE)] * 2,
+            )
+            session.run_in_transaction.assert_called_once_with(unit_of_work)
+            put_session.assert_called_once_with(session)
+
+    def test_run_in_transaction_recovers_after_transaction_failure(self):
+        instance = _Instance(self.INSTANCE_NAME, client=_Client())
+        database = self._make_one(self.DATABASE_ID, instance, pool=_Pool())
+        session = mock.create_autospec(Session, instance=True)
+        error = ValueError("Transaction failed")
+        session.run_in_transaction.side_effect = [error, "committed"]
+        unit_of_work = mock.Mock()
+
+        with (
+            mock.patch.object(
+                database._sessions_manager, "get_session", return_value=session
+            ),
+            mock.patch.object(database._sessions_manager, "put_session") as put_session,
+        ):
+            with self.assertRaises(ValueError) as raised:
+                database.run_in_transaction(unit_of_work)
+
+            self.assertIs(raised.exception, error)
+            put_session.assert_called_once_with(session)
+
+            self.assertEqual(database.run_in_transaction(unit_of_work), "committed")
+            self.assertEqual(put_session.call_args_list, [mock.call(session)] * 2)
+
     def test_restore_backup_unspecified(self):
         instance = _Instance(self.INSTANCE_NAME, client=_Client())
         database = self._make_one(self.DATABASE_ID, instance)
