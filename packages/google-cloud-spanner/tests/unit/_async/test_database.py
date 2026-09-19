@@ -1938,6 +1938,76 @@ class TestDatabase(_BaseTest):
         self.assertEqual(inner.call_count, 0)
 
     @CrossSync.pytest
+    async def test_run_in_transaction_recovers_after_session_acquisition_failure(self):
+        from google.api_core.exceptions import ServiceUnavailable
+
+        for error in (
+            ServiceUnavailable("Spanner is temporarily unavailable"),
+            asyncio.CancelledError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                instance = _Instance(self.INSTANCE_NAME, client=_Client())
+                database = await self._make_one(
+                    self.DATABASE_ID, instance, pool=_Pool()
+                )
+                session = mock.create_autospec(Session, instance=True)
+                session.run_in_transaction.return_value = "committed"
+                unit_of_work = mock.Mock()
+
+                with (
+                    mock.patch.object(
+                        database._sessions_manager,
+                        "get_session",
+                        side_effect=[error, session],
+                    ) as get_session,
+                    mock.patch.object(
+                        database._sessions_manager, "put_session"
+                    ) as put_session,
+                ):
+                    with self.assertRaises(type(error)) as raised:
+                        await database.run_in_transaction(unit_of_work)
+
+                    self.assertIs(raised.exception, error)
+                    unit_of_work.assert_not_called()
+                    put_session.assert_not_awaited()
+
+                    result = await database.run_in_transaction(unit_of_work)
+
+                    self.assertEqual(result, "committed")
+                    self.assertEqual(
+                        get_session.await_args_list,
+                        [mock.call(TransactionType.READ_WRITE)] * 2,
+                    )
+                    session.run_in_transaction.assert_awaited_once_with(unit_of_work)
+                    put_session.assert_awaited_once_with(session)
+
+    @CrossSync.pytest
+    async def test_run_in_transaction_recovers_after_transaction_failure(self):
+        instance = _Instance(self.INSTANCE_NAME, client=_Client())
+        database = await self._make_one(self.DATABASE_ID, instance, pool=_Pool())
+        session = mock.create_autospec(Session, instance=True)
+        error = ValueError("Transaction failed")
+        session.run_in_transaction.side_effect = [error, "committed"]
+        unit_of_work = mock.Mock()
+
+        with (
+            mock.patch.object(
+                database._sessions_manager, "get_session", return_value=session
+            ),
+            mock.patch.object(database._sessions_manager, "put_session") as put_session,
+        ):
+            with self.assertRaises(ValueError) as raised:
+                await database.run_in_transaction(unit_of_work)
+
+            self.assertIs(raised.exception, error)
+            put_session.assert_awaited_once_with(session)
+
+            self.assertEqual(
+                await database.run_in_transaction(unit_of_work), "committed"
+            )
+            self.assertEqual(put_session.await_args_list, [mock.call(session)] * 2)
+
+    @CrossSync.pytest
     async def test_restore_backup_unspecified(self):
         instance = _Instance(self.INSTANCE_NAME, client=_Client())
         database = await self._make_one(self.DATABASE_ID, instance)
